@@ -1,0 +1,366 @@
+// SignalFlow — Prisma schema
+// Phase 1 models only (single-org internal tool, no multi-tenancy).
+// Contact / Re-Engagement (Phase 2) and Signal / AI (Phase 3) models
+// are intentionally NOT included yet — they arrive with their features.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // pooled (app runtime)
+  directUrl = env("DIRECT_URL")   // direct (migrations)
+}
+
+// ─── Users (Clerk mirror, for attribution) ───────────────────
+
+model User {
+  id          String   @id @default(cuid())
+  clerkUserId String   @unique
+  email       String
+  name        String?
+  isAdmin     Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  activities     Activity[]
+  ownedCompanies Company[]  @relation("CompanyOwner")
+}
+
+// ─── Companies ───────────────────────────────────────────────
+
+model Company {
+  id               String        @id @default(cuid())
+  name             String
+  domain           String? // user-facing domain, e.g. "stripe.com"
+  normalizedDomain String?       @unique // cleaned domain — used to prevent duplicates
+  linkedinUrl      String?
+  country          String?
+  industry         String?
+  employeeCount    Int?
+  status           CompanyStatus @default(NEW)
+  source           CompanySource @default(MANUAL)
+  externalRef      String? // stable key from the source sheet/CSV row
+
+  // ── CRM fields ──
+  pipelineStage  PipelineStage @default(NOT_REACHED_OUT)
+  priority       Priority      @default(MEDIUM)
+  sdrOwnerId     String?
+  lastOutreachAt DateTime?
+  nextFollowUpAt DateTime?
+  meetingAt      DateTime?
+  meetingLink    String?
+  notes          String?
+
+  // Apollo enrichment cache
+  description          String?
+  headquarters         String?
+  apolloOrganizationId String?
+  lastEnrichedAt       DateTime?
+  lastSyncedAt         DateTime?
+
+  // Intent intelligence (computed from Signals)
+  intentScore   Int         @default(0)
+  intentLevel   IntentLevel @default(LOW)
+  lastScannedAt DateTime?
+
+  // ICP qualification (fit)
+  icpScore    Int       @default(0)
+  icpStatus   IcpStatus @default(UNKNOWN)
+  icpCategory String?
+  icpReason   String?
+  icpSignals  String[] // matched ICP/billing signals, e.g. ["Subscription billing"]
+
+  // Qualification workflow / CRM
+  inCrm Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner              User?               @relation("CompanyOwner", fields: [sdrOwnerId], references: [id])
+  activities         Activity[]
+  lists              ListCompany[]
+  contacts           Contact[]
+  stakeholderChanges StakeholderChange[]
+  reEngagementAlerts ReEngagementAlert[]
+  signals            Signal[]
+  snapshots          CompanySnapshot[]
+
+  @@index([status])
+  @@index([pipelineStage])
+  @@index([sdrOwnerId])
+  @@index([nextFollowUpAt])
+  @@index([intentScore])
+  @@index([icpStatus])
+  @@index([inCrm])
+  @@index([createdAt])
+  @@index([name])
+}
+
+// ─── Lists (optional grouping / segments) ────────────────────
+
+model List {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+
+  companies ListCompany[]
+}
+
+model ListCompany {
+  listId    String
+  companyId String
+  addedAt   DateTime @default(now())
+
+  list    List    @relation(fields: [listId], references: [id], onDelete: Cascade)
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@id([listId, companyId])
+  @@index([companyId])
+}
+
+// ─── CRM: Activity timeline ──────────────────────────────────
+// Every CRM event (note added, stage changed, follow-up scheduled,
+// meeting booked, outreach logged) is one Activity row. This is the
+// per-company timeline shown on the detail page.
+
+model Activity {
+  id         String           @id @default(cuid())
+  companyId  String
+  userId     String? // who performed it
+  type       ActivityType
+  body       String? // note text or human-readable description
+  channel    OutreachChannel? // set for OUTREACH activities
+  occurredAt DateTime         @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User?   @relation(fields: [userId], references: [id])
+
+  @@index([companyId, occurredAt])
+  @@index([occurredAt])
+}
+
+// ─── Contacts (Apollo people) ────────────────────────────────
+
+model Contact {
+  id              String   @id @default(cuid())
+  companyId       String
+  apolloContactId String?  @unique
+  name            String
+  title           String?
+  seniority       String?
+  email           String?
+  linkedinUrl     String?
+  firstSeenAt     DateTime @default(now())
+  lastSeenAt      DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  company         Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  changes         StakeholderChange[]
+  suggestedAlerts ReEngagementAlert[]
+
+  @@index([companyId])
+  @@index([name])
+}
+
+// ─── Re-Engagement: detected people changes ──────────────────
+
+model StakeholderChange {
+  id         String                @id @default(cuid())
+  companyId  String
+  contactId  String?
+  type       StakeholderChangeType
+  detail     Json
+  detectedAt DateTime              @default(now())
+
+  company Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contact Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, detectedAt])
+}
+
+// ─── Re-Engagement: "Accounts worth revisiting" alerts ───────
+
+model ReEngagementAlert {
+  id                 String                 @id @default(cuid())
+  companyId          String
+  signalType         ReEngagementSignalType
+  reason             String
+  detail             Json?
+  suggestedContactId String?
+  score              Int                    @default(0)
+  resolved           Boolean                @default(false)
+  createdAt          DateTime               @default(now())
+
+  company          Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  suggestedContact Contact? @relation(fields: [suggestedContactId], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([resolved, createdAt])
+}
+
+// ─── Intent signals ──────────────────────────────────────────
+
+model Signal {
+  id          String     @id @default(cuid())
+  companyId   String
+  signalType  SignalType
+  title       String
+  description String?
+  source      String // which collector / source produced it
+  sourceUrl   String?
+  detectedAt  DateTime   @default(now())
+  signalScore Int        @default(0)
+  resolved    Boolean    @default(false)
+  createdAt   DateTime   @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, resolved])
+  @@index([signalType])
+  @@index([detectedAt])
+}
+
+// ─── Historical snapshots (for change-based signal generation) ─
+
+model CompanySnapshot {
+  id            String   @id @default(cuid())
+  companyId     String
+  capturedAt    DateTime @default(now())
+  employeeCount Int?
+  hash          String // fingerprint of monitored surface — skip work when unchanged
+  payload       Json
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, capturedAt])
+}
+
+// ─── Google Sheets connection + sync history ─────────────────
+
+model SheetConnection {
+  id                  String    @id @default(cuid())
+  name                String    @default("Primary sheet")
+  sheetUrl            String
+  sheetId             String
+  sheetName           String? // tab name; defaults to the first tab
+  columnMapping       Json? // { name: "Company Name", domain: "Domain", ... }
+  credentialsJson     String? // uploaded Google service-account JSON
+  serviceAccountEmail String?
+  autoDailySync       Boolean   @default(false)
+  lastSyncAt          DateTime?
+  lastImported        Int       @default(0)
+  lastUpdated         Int       @default(0)
+  lastFailed          Int       @default(0)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  histories SyncHistory[]
+}
+
+model SyncHistory {
+  id           String     @id @default(cuid())
+  connectionId String
+  status       SyncStatus @default(RUNNING)
+  rowsImported Int        @default(0)
+  rowsUpdated  Int        @default(0)
+  rowsFailed   Int        @default(0)
+  errors       Json?
+  startedAt    DateTime   @default(now())
+  finishedAt   DateTime?
+
+  connection SheetConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([connectionId, startedAt])
+}
+
+// ─── Enums ───────────────────────────────────────────────────
+
+enum CompanyStatus {
+  NEW
+  REACHED_OUT
+  CUSTOMER
+}
+
+enum CompanySource {
+  SHEET
+  CSV
+  MANUAL
+  APOLLO
+}
+
+enum OutreachChannel {
+  EMAIL
+  LINKEDIN
+  CALL
+  OTHER
+}
+
+enum PipelineStage {
+  NOT_REACHED_OUT
+  REACHED_OUT
+  REPLIED
+  MEETING_BOOKED
+  CLOSED_WON
+  CLOSED_LOST
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum ActivityType {
+  NOTE
+  STAGE_CHANGE
+  FOLLOW_UP
+  MEETING
+  OUTREACH
+}
+
+enum SignalType {
+  FUNDING
+  HIRING
+  HEADCOUNT_GROWTH
+  PRODUCT_LAUNCH
+  EXPANSION
+  LEADERSHIP_CHANGE
+  PARTNERSHIP
+}
+
+enum IntentLevel {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum IcpStatus {
+  UNKNOWN
+  QUALIFIED
+  REVIEW
+  DISQUALIFIED
+}
+
+enum StakeholderChangeType {
+  NEW_EMPLOYEE
+  PROMOTION
+  TITLE_CHANGE
+  NEW_DECISION_MAKER
+}
+
+enum ReEngagementSignalType {
+  NEW_STAKEHOLDER
+  STAKEHOLDER_PROMOTED
+  HEADCOUNT_GROWTH
+}
+
+enum SyncStatus {
+  RUNNING
+  SUCCESS
+  FAILED
+}
